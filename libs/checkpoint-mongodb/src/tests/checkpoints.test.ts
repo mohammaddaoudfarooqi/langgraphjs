@@ -72,10 +72,15 @@ describe("MongoDBSaver", () => {
   });
 
   describe("setup", () => {
-    it("should create compound indexes on both collections", async () => {
+    const listIndexesMock = vi.fn(() => ({
+      toArray: () => Promise.resolve([]),
+    }));
+
+    it("should create unique compound indexes on all three collections", async () => {
       const createIndexMock = vi.fn().mockResolvedValue("ok");
       const collectionMock = vi.fn(() => ({
         createIndex: createIndexMock,
+        listIndexes: listIndexesMock,
         find: vi.fn(() => ({
           sort: vi.fn(() => ({
             limit: vi.fn(() => ({
@@ -97,14 +102,19 @@ describe("MongoDBSaver", () => {
       expect(errors).toEqual([]);
       expect(collectionMock).toHaveBeenCalledWith("checkpoints");
       expect(collectionMock).toHaveBeenCalledWith("checkpoint_writes");
-      expect(createIndexMock).toHaveBeenCalledTimes(2);
+      expect(collectionMock).toHaveBeenCalledWith("checkpoint_blobs");
+      expect(createIndexMock).toHaveBeenCalledTimes(3);
       expect(createIndexMock).toHaveBeenCalledWith(
         { thread_id: 1, checkpoint_ns: 1, checkpoint_id: -1 },
-        { name: "thread_ns_checkpoint_idx" }
+        { name: "thread_ns_checkpoint_idx", unique: true }
       );
       expect(createIndexMock).toHaveBeenCalledWith(
         { thread_id: 1, checkpoint_ns: 1, checkpoint_id: 1, task_id: 1, idx: 1 },
-        { name: "thread_ns_checkpoint_task_idx" }
+        { name: "thread_ns_checkpoint_task_idx", unique: true }
+      );
+      expect(createIndexMock).toHaveBeenCalledWith(
+        { thread_id: 1, checkpoint_ns: 1, channel: 1, version: 1 },
+        { name: "thread_ns_channel_version_idx", unique: true }
       );
     });
 
@@ -112,6 +122,7 @@ describe("MongoDBSaver", () => {
       const mockCreateIndex = vi.fn().mockResolvedValue("ok");
       const mockCollection = vi.fn(() => ({
         createIndex: mockCreateIndex,
+        listIndexes: listIndexesMock,
       }));
       const client = {
         appendMetadata: vi.fn(),
@@ -129,11 +140,11 @@ describe("MongoDBSaver", () => {
 
       expect(mockCollection).toHaveBeenCalledWith("checkpoints");
       expect(mockCollection).toHaveBeenCalledWith("checkpoint_writes");
-      // 2 compound indexes + 2 TTL indexes
-      expect(mockCreateIndex).toHaveBeenCalledTimes(4);
+      // 3 unique compound indexes + 2 TTL indexes
+      expect(mockCreateIndex).toHaveBeenCalledTimes(5);
       expect(mockCreateIndex).toHaveBeenCalledWith(
         { thread_id: 1, checkpoint_ns: 1, checkpoint_id: -1 },
-        { name: "thread_ns_checkpoint_idx" }
+        { name: "thread_ns_checkpoint_idx", unique: true }
       );
       expect(mockCreateIndex).toHaveBeenCalledWith(
         { upserted_at: 1 },
@@ -145,6 +156,7 @@ describe("MongoDBSaver", () => {
       const mockCreateIndex = vi.fn().mockResolvedValue("ok");
       const mockCollection = vi.fn(() => ({
         createIndex: mockCreateIndex,
+        listIndexes: listIndexesMock,
       }));
       const client = {
         appendMetadata: vi.fn(),
@@ -159,8 +171,8 @@ describe("MongoDBSaver", () => {
 
       await saver.setup();
 
-      // Only the 2 compound indexes, no TTL index.
-      expect(mockCreateIndex).toHaveBeenCalledTimes(2);
+      // Only the 3 compound indexes, no TTL index.
+      expect(mockCreateIndex).toHaveBeenCalledTimes(3);
       expect(mockCreateIndex).not.toHaveBeenCalledWith(
         { upserted_at: 1 },
         expect.anything()
@@ -171,6 +183,7 @@ describe("MongoDBSaver", () => {
       const mockCreateIndex = vi.fn().mockResolvedValue("ok");
       const mockCollection = vi.fn(() => ({
         createIndex: mockCreateIndex,
+        listIndexes: listIndexesMock,
       }));
       const client = {
         appendMetadata: vi.fn(),
@@ -194,6 +207,7 @@ describe("MongoDBSaver", () => {
         .mockRejectedValue(new Error("Index creation failed"));
       const mockCollection = vi.fn(() => ({
         createIndex: mockCreateIndex,
+        listIndexes: listIndexesMock,
       }));
       const client = {
         appendMetadata: vi.fn(),
@@ -208,8 +222,8 @@ describe("MongoDBSaver", () => {
       });
 
       const errors = await saver.setup();
-      // 2 compound + 2 TTL index creations all fail.
-      expect(errors).toHaveLength(4);
+      // 3 compound + 2 TTL index creations all fail.
+      expect(errors).toHaveLength(5);
       expect(errors[0].message).toBe("Index creation failed");
     });
   });

@@ -1535,6 +1535,9 @@ importers:
         specifier: ^6.21.0
         version: 6.21.0(socks@2.8.7)
     devDependencies:
+      '@langchain/langgraph':
+        specifier: workspace:*
+        version: link:../langgraph-core
       '@langchain/langgraph-checkpoint':
         specifier: workspace:*
         version: link:../checkpoint
