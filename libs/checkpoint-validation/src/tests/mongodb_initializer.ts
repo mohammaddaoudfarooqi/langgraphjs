@@ -10,12 +10,32 @@ import type { CheckpointerTestInitializer } from "../types.js";
 
 const dbName = "test_db";
 
-const container = new MongoDBContainer("mongo:6.0.1");
+// Both MongoDB write paths must pass the suite (REQ-E-041): MongoDB 8.0+
+// uses one client-level bulkWrite, 7.x an ordered collection bulkWrite plus
+// the manifest upsert. Select the server with MONGODB_IMAGE (e.g. mongo:7).
+// eslint-disable-next-line no-process-env
+const image = process.env.MONGODB_IMAGE ?? "mongo:8";
+
+const container = new MongoDBContainer(image);
 
 let startedContainer: StartedMongoDBContainer;
 let client: MongoClient | undefined;
 
-export const initializer: CheckpointerTestInitializer<MongoDBSaver> = {
+/**
+ * Stores every checkpoint in the per-channel layout, including the integer
+ * channel versions the conformance fixtures use (which the default saver
+ * keeps in the single-document format for threads written by older releases).
+ */
+class Layout2MongoDBSaver extends MongoDBSaver {
+  protected useLayout2(): boolean {
+    return true;
+  }
+}
+
+function createInitializer(
+  forceLayout2: boolean
+): CheckpointerTestInitializer<MongoDBSaver> {
+  return {
   checkpointerName: "@langchain/langgraph-checkpoint-mongodb",
 
   async beforeAll() {
@@ -34,15 +54,22 @@ export const initializer: CheckpointerTestInitializer<MongoDBSaver> = {
     await db.dropDatabase();
     await client!.db(dbName);
 
-    return new MongoDBSaver({
-      client: client!,
-    });
+    const saver = forceLayout2
+      ? new Layout2MongoDBSaver({ client: client! })
+      : new MongoDBSaver({ client: client! });
+    await saver.setup();
+    return saver;
   },
 
   async afterAll() {
     await client?.close();
     await startedContainer.stop();
   },
-};
+  };
+}
+
+export const initializer = createInitializer(false);
+
+export const layout2Initializer = createInitializer(true);
 
 export default initializer;
