@@ -14,6 +14,7 @@ import {
 } from "../index.js";
 import type { DocumentSizeInfo } from "../index.js";
 import { VERSION_PATTERN } from "../versions.js";
+import { MongoDBSerializer } from "../serde.js";
 import { dropTestDb, newClient, uniqueDbName } from "./int_utils.js";
 
 const MiB = 1024 * 1024;
@@ -92,14 +93,12 @@ describe("layout 2 write/read path", () => {
     expect(manifest).not.toBeNull();
     expect(manifest!.layout).toBe(2);
     expect(manifest!.checkpoint_id).toBe(cp.id);
-    expect(manifest!.inline_channels.sort()).toEqual(
-      ["flag", "nil", "num", "small"].sort()
+    expect(manifest!.inline_channels).toEqual([]);
+    expect(manifest!.blob_refs).toEqual(
+      Object.keys(cp.channel_values).map((channel) => ({
+        channel, version: cp.channel_versions[channel],
+      }))
     );
-    expect(manifest!.blob_refs).toEqual([
-      { channel: "obj", version: cp.channel_versions.obj },
-      { channel: "list", version: cp.channel_versions.list },
-      { channel: "long", version: cp.channel_versions.long },
-    ]);
     for (const v of Object.values(cp.channel_versions)) {
       expect(v).toMatch(VERSION_PATTERN);
     }
@@ -109,12 +108,12 @@ describe("layout 2 write/read path", () => {
       .sort({ channel: 1 })
       .toArray();
     expect(blobs).toEqual(
-      ["list", "long", "obj"].map((channel) => ({
+      ["flag", "list", "long", "nil", "num", "obj", "small"].map((channel) => ({
         thread_id,
         checkpoint_ns: "",
         channel,
         version: cp.channel_versions[channel],
-        type: "json",
+        type: ["list", "long", "obj"].includes(channel) ? "json" : null,
       }))
     );
 
@@ -134,6 +133,53 @@ describe("layout 2 write/read path", () => {
     const tuple = await saver.getTuple({ configurable: { thread_id } });
     expect(tuple!.checkpoint.channel_values).toEqual({ a: { v: 2 }, b: { v: 1 } });
     expect(tuple!.checkpoint).toEqual(cp2);
+  });
+
+  it("queries native scalar versions and resumes native and typed pending writes", async () => {
+    const saver = new MongoDBSaver({ client, dbName });
+    const thread_id = uuid6(-1);
+    const t = new ThreadDriver(saver, thread_id);
+    const prompt = "A constant prompt";
+    const cp1 = await t.step({ "system.prompt": prompt });
+    const cp2 = await t.step({ count: 2 });
+    await saver.putWrites(t.config, [["approval", null], ["structured", { x: 1 }]], "task");
+
+    expect(await coll("checkpoint_blobs").countDocuments({
+      thread_id, channel: "system.prompt", type: { $type: "null" }, value: prompt,
+    })).toBe(1);
+    expect(await coll("checkpoints").countDocuments({
+      thread_id, blob_refs: { $elemMatch: { channel: "system.prompt", version: cp1.channel_versions["system.prompt"] } },
+    })).toBe(2);
+    expect(await coll("checkpoint_writes").countDocuments({
+      thread_id, channel: "approval", type: { $type: "null" }, value: { $type: "null" },
+    })).toBe(1);
+    const reader = new MongoDBSaver({ client, dbName });
+    const tuple = await reader.getTuple(t.config);
+    expect(tuple?.checkpoint).toEqual(cp2);
+    expect(tuple?.pendingWrites).toEqual([["task", "approval", null], ["task", "structured", { x: 1 }]]);
+    const checkpoints = [];
+    for await (const row of reader.list({ configurable: { thread_id } })) {
+      checkpoints.push(row.checkpoint);
+    }
+    expect(checkpoints).toEqual([cp2, cp1]);
+  });
+
+  it("materializes an unchanged scalar formerly stored in a layout 2 manifest", async () => {
+    const legacy = new MongoDBSaver({ client, dbName }, new MongoDBSerializer());
+    const thread_id = uuid6(-1);
+    const t = new ThreadDriver(legacy, thread_id);
+    const cp1 = await t.step({ prompt: "old layout 2", count: 2 ** 42 });
+    await legacy.putWrites(t.config, [["approval", true]], "task");
+    expect(await coll("checkpoint_blobs").countDocuments({ thread_id })).toBe(0);
+    expect((await coll("checkpoint_writes").findOne({ thread_id }))?.type).toBe("json");
+
+    t.saver = new MongoDBSaver({ client, dbName });
+    const existing = await t.saver.getTuple(t.config);
+    expect(existing?.checkpoint).toEqual(cp1);
+    expect(existing?.pendingWrites).toEqual([["task", "approval", true]]);
+    const cp2 = await t.step({});
+    expect((await t.saver.getTuple(t.config))?.checkpoint).toEqual(cp2);
+    expect(await coll("checkpoint_blobs").countDocuments({ thread_id, type: { $type: "null" } })).toBe(2);
   });
 
   it("TC-034: a failed manifest write leaves no manifest; a retry succeeds", async () => {

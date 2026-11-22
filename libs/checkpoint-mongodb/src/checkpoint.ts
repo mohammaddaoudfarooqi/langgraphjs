@@ -37,6 +37,7 @@ import {
   compareWrites,
   DEFAULT_INLINE_MAX_CHARS,
   isLayout2,
+  isNativeScalar,
   manifestDocument,
   mergeBlobs,
   missingRefs,
@@ -47,6 +48,7 @@ import {
   checkSize,
   DEFAULT_MAX_DOCUMENT_BYTES,
   DEFAULT_SIZE_WARNING_RATIO,
+  measure,
 } from "./size.js";
 
 export type MongoDBSaverParams = {
@@ -81,8 +83,9 @@ export type MongoDBSaverParams = {
   /** Called with the collection and BSON size of every document written. */
   onDocumentSize?: (info: DocumentSizeInfo) => void;
   /**
-   * Strings longer than this many characters are stored in
-   * `checkpoint_blobs` rather than inline in the manifest. Defaults to 1024.
+   * Legacy inline string threshold, defaulting to 1024 characters. Also
+   * bounds the UTF-8 bytes of native BSON strings, up to 1024. Keep it
+   * consistent across writers for existing threads.
    */
   inlineMaxChars?: number;
   /**
@@ -255,6 +258,7 @@ export class MongoDBSaver extends BaseCheckpointSaver {
   protected maxDocumentBytes: number;
 
   protected inlineMaxChars: number;
+  private readonly nativeScalars: boolean;
 
   protected historyBatchSize: number;
 
@@ -288,6 +292,7 @@ export class MongoDBSaver extends BaseCheckpointSaver {
     serde?: SerializerProtocol
   ) {
     super(serde ?? new MongoDBSerializer());
+    this.nativeScalars = serde === undefined;
     this.baseSerde = this.serde;
     // Always able to read compressed values; compresses blobs and pending
     // writes only when `compression` is configured (manifest metadata never).
@@ -360,6 +365,18 @@ export class MongoDBSaver extends BaseCheckpointSaver {
         return { channel, bytes: bytes.length };
       })
     );
+  }
+
+  private async storeValue(value: unknown, native: boolean) {
+    if (native) return { type: null, value };
+    const [type, bytes] = await this.serde.dumpsTyped(value);
+    return { type, value: bytes };
+  }
+
+  private loadValue(doc: Document) {
+    return doc.type === null
+      ? doc.value
+      : this.serde.loadsTyped(doc.type, binaryValue(doc.value));
   }
 
   /**
@@ -603,7 +620,7 @@ export class MongoDBSaver extends BaseCheckpointSaver {
       docs.map(async (b) => ({
         channel: b.channel as string,
         version: b.version,
-        value: await this.serde.loadsTyped(b.type, binaryValue(b.value)),
+        value: await this.loadValue(b),
       }))
     );
   }
@@ -630,10 +647,7 @@ export class MongoDBSaver extends BaseCheckpointSaver {
           [
             serializedWrite.task_id,
             serializedWrite.channel,
-            await this.serde.loadsTyped(
-              serializedWrite.type,
-              binaryValue(serializedWrite.value)
-            ),
+            await this.loadValue(serializedWrite),
           ] as CheckpointPendingWrite
       )
     );
@@ -778,6 +792,7 @@ export class MongoDBSaver extends BaseCheckpointSaver {
     if (this.useLayout2(checkpoint)) {
       const plan = buildManifest(checkpoint, {
         inlineMaxChars: this.inlineMaxChars,
+        nativeScalars: this.nativeScalars,
       });
       const drafts = buildBlobDocs(plan, {
         threadId: thread_id,
@@ -787,12 +802,15 @@ export class MongoDBSaver extends BaseCheckpointSaver {
       // Serialize and size-check every blob before writing anything.
       const blobDocs = await Promise.all(
         drafts.map(async ({ value, ...key }) => {
-          const [type, bytes] = await this.serde.dumpsTyped(value);
-          const doc = { ...key, type, value: bytes, ...timestamp };
+          const stored = await this.storeValue(
+            value,
+            plan.nativeChannels.has(key.channel)
+          );
+          const doc = { ...key, ...stored, ...timestamp };
           await this.checkDocumentSize(
             this.checkpointBlobsCollectionName,
             doc,
-            () => [{ channel: key.channel, bytes: bytes.length }]
+            () => [{ channel: key.channel, bytes: storedValueSize(stored) }]
           );
           return doc;
         })
@@ -1065,14 +1083,20 @@ export class MongoDBSaver extends BaseCheckpointSaver {
           idx: WRITES_IDX_MAP[channel] ?? idx,
         };
 
-        const [type, serializedValue] = await this.serde.dumpsTyped(value);
+        const stored = await this.storeValue(
+          value,
+          this.nativeScalars &&
+            isNativeScalar(
+              value,
+              Math.min(this.inlineMaxChars, DEFAULT_INLINE_MAX_CHARS)
+            )
+        );
         // `task_path` is the serialized task path; `""` sorts first (see
         // `writesSortKey`). It is not part of the upsert filter, so rows
         // written before it existed keep matching.
         const fields = {
           channel,
-          type,
-          value: serializedValue,
+          ...stored,
           task_path: taskPath ?? "",
         };
         await this.checkDocumentSize(
@@ -1082,7 +1106,7 @@ export class MongoDBSaver extends BaseCheckpointSaver {
             ...fields,
             ...(this.enableTimestamps ? { upserted_at: new Date() } : {}),
           },
-          () => [{ channel, bytes: serializedValue.length }]
+          () => [{ channel, bytes: storedValueSize(stored) }]
         );
 
         return {
@@ -1381,7 +1405,7 @@ export class MongoDBSaver extends BaseCheckpointSaver {
             [
               w.task_id,
               w.channel,
-              await this.serde.loadsTyped(w.type, binaryValue(w.value)),
+              await this.loadValue(w),
             ] as CheckpointPendingWrite
         )
       );
@@ -1553,6 +1577,12 @@ function isThreadsDuplicateKey(e: unknown): boolean {
 }
 
 /** `Binary.value()` (the driver) or a raw value (tests' mocks). */
+function storedValueSize(doc: { type: string | null; value: unknown }): number {
+  return doc.type === null
+    ? measure({ value: doc.value }) - measure({ value: null })
+    : (doc.value as Uint8Array).length;
+}
+
 function binaryValue(b: { value: (asRaw?: unknown) => unknown } | Uint8Array) {
   if (ArrayBuffer.isView(b)) return b as Uint8Array;
   return b.value("utf8" as unknown) as Uint8Array | string;

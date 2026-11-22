@@ -94,7 +94,7 @@ describe("thread-scoped retention", () => {
       olderThan: new Date(Date.now() - 60_000),
     });
     expect(result.threads).toBe(1);
-    expect(result.documents).toBe(2 + 1 + 2); // manifests + writes + blobs
+    expect(result.documents).toBe(2 + 1 + 4); // manifests + writes + blobs
     for (const c of ["checkpoints", "checkpoint_writes", "checkpoint_blobs"]) {
       expect(await coll(c).countDocuments({ thread_id })).toBe(0);
     }
@@ -178,7 +178,7 @@ describe("thread-scoped retention", () => {
     const result = await retained().sweepExpired({
       olderThan: new Date(Date.now() - 60_000),
     });
-    expect(result).toEqual({ threads: 1, documents: 1 + 2 + 1 });
+    expect(result).toEqual({ threads: 1, documents: 1 + 2 + 2 });
     for (const c of ["checkpoints", "checkpoint_writes", "checkpoint_blobs"]) {
       expect(await coll(c).countDocuments({ thread_id })).toBe(0);
     }

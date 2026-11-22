@@ -53,6 +53,20 @@ export function classifyChannel(
   }
 }
 
+export function isNativeScalar(
+  value: unknown,
+  maxStringBytes: number
+): boolean {
+  if (value === null || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  return (
+    typeof value === "string" &&
+    value.length <= maxStringBytes &&
+    !/[\uD800-\uDFFF]/u.test(value) &&
+    Buffer.byteLength(value, "utf8") <= maxStringBytes
+  );
+}
+
 export interface ManifestPlan {
   /** Copy of the checkpoint whose `channel_values` holds inline channels only. */
   checkpoint: Checkpoint;
@@ -62,6 +76,7 @@ export interface ManifestPlan {
   inlineChannels: string[];
   /** Externalized values by channel. */
   blobValues: Record<string, unknown>;
+  nativeChannels: Set<string>;
 }
 
 /**
@@ -72,13 +87,14 @@ export interface ManifestPlan {
  */
 export function buildManifest(
   checkpoint: Checkpoint,
-  options: { inlineMaxChars?: number } = {}
+  options: { inlineMaxChars?: number; nativeScalars?: boolean } = {}
 ): ManifestPlan {
   const inlineMaxChars = options.inlineMaxChars ?? DEFAULT_INLINE_MAX_CHARS;
-  const inline: Record<string, unknown> = {};
+  const inline: Record<string, unknown> = Object.create(null);
   const blobRefs: BlobRef[] = [];
   const inlineChannels: string[] = [];
-  const blobValues: Record<string, unknown> = {};
+  const blobValues: Record<string, unknown> = Object.create(null);
+  const nativeChannels = new Set<string>();
   const versions = checkpoint.channel_versions ?? {};
   for (const [channel, value] of Object.entries(
     checkpoint.channel_values ?? {}
@@ -86,23 +102,28 @@ export function buildManifest(
     const version = Object.prototype.hasOwnProperty.call(versions, channel)
       ? versions[channel]
       : undefined;
+    const native =
+      options.nativeScalars &&
+      isNativeScalar(value, Math.min(inlineMaxChars, DEFAULT_INLINE_MAX_CHARS));
     if (
       version === undefined ||
       version === null ||
-      classifyChannel(value, inlineMaxChars) === "inline"
+      (!native && classifyChannel(value, inlineMaxChars) === "inline")
     ) {
       inline[channel] = value;
       inlineChannels.push(channel);
     } else {
       blobRefs.push({ channel, version });
       blobValues[channel] = value;
+      if (native) nativeChannels.add(channel);
     }
   }
   return {
-    checkpoint: { ...checkpoint, channel_values: inline },
+    checkpoint: { ...checkpoint, channel_values: { ...inline } },
     blobRefs,
     inlineChannels,
     blobValues,
+    nativeChannels,
   };
 }
 
@@ -118,7 +139,8 @@ export interface BlobDocDraft {
 /**
  * Blob documents to write for this checkpoint (REQ-E-032/033): only the
  * externalized channels named in `newVersions`, or all of them when
- * `newVersions` is undefined.
+ * `newVersions` is undefined. Include native scalars on unchanged versions
+ * as well, since a prior manifest may have held that version inline.
  */
 export function buildBlobDocs(
   plan: ManifestPlan,
@@ -133,6 +155,7 @@ export function buildBlobDocs(
     .filter(
       (ref) =>
         newVersions === undefined ||
+        plan.nativeChannels.has(ref.channel) ||
         Object.prototype.hasOwnProperty.call(newVersions, ref.channel)
     )
     .map((ref) => ({
@@ -177,8 +200,8 @@ export function mergeBlobs(
 ): Checkpoint {
   const channelValues: Record<string, unknown> = {
     ...manifestCheckpoint.channel_values,
+    ...Object.fromEntries(blobs.map(({ channel, value }) => [channel, value])),
   };
-  for (const blob of blobs) channelValues[blob.channel] = blob.value;
   return { ...manifestCheckpoint, channel_values: channelValues };
 }
 

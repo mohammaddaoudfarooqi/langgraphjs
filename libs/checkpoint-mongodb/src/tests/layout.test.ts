@@ -7,6 +7,7 @@ import {
   buildBlobDocs,
   mergeBlobs,
   isLayout2,
+  isNativeScalar,
   manifestDocument,
   LAYOUT_VERSION,
 } from "../layout.js";
@@ -29,6 +30,15 @@ function cp(
 }
 
 describe("layout core", () => {
+  it("limits native scalars to BSON-safe values and UTF-8 bytes", () => {
+    for (const value of [null, false, 2 ** 53 - 1, -0, "", "éé", "😀"]) {
+      expect(isNativeScalar(value, 4)).toBe(true);
+    }
+    for (const value of [undefined, 3n, Infinity, NaN, "ééé", "\ud800", {}]) {
+      expect(isNativeScalar(value, 4)).toBe(false);
+    }
+  });
+
   it.each([
     ["null", null, "inline"],
     ["undefined", undefined, "inline"],

@@ -77,6 +77,7 @@ describe("write path dispatch", () => {
     expect(ops.map((o) => nsInfo[o.update].ns)).toEqual([
       `${dbName}.checkpoint_blobs`,
       `${dbName}.checkpoint_blobs`,
+      `${dbName}.checkpoint_blobs`,
       `${dbName}.checkpoints`,
     ]);
   });
